@@ -1,0 +1,1364 @@
+/**
+ * @license
+ * FRAOVIA - Business Management Platform
+ * Multi-Club SaaS Architecture with PostgreSQL RLS & Mobile-First UX
+ */
+
+import React, { useState, useMemo, useEffect } from 'react';
+import { 
+  Club, 
+  User, 
+  Season, 
+  Player, 
+  Receipt, 
+  CashBox, 
+  CashMovement, 
+  StoreProduct, 
+  StoreSale, 
+  StorePromotion,
+  TripTournament,
+  AttendanceRecord,
+  ProvisionalPlayer,
+  CoachApprovalRequest,
+  CommercialPlan, 
+  BetaFeature, 
+  AuditLog,
+  Discipline,
+  Category,
+  ChargeType
+} from './types/fraovia';
+import { fraoviaDB } from './services/fraoviaStore';
+import { isPendingFirstPayment } from './services/paymentStatus';
+import { supabaseDataService, formatSupabaseError } from './services/supabaseDataService';
+import { dataActions } from './services/dataActions';
+import { supabaseTripService } from './services/supabaseTripService';
+import { supabaseProvisionalService } from './services/supabaseProvisionalService';
+import { supabaseFamilyService } from './services/supabaseFamilyService';
+import { supabaseStoreService } from './services/supabaseStoreService';
+import { supabaseReceiptService } from './services/supabaseReceiptService';
+import { supabaseAuthService } from './services/supabaseAuthService';
+import { isSupabaseConfigured } from './lib/supabaseClient';
+
+// Components
+import { Header } from './components/Header';
+import { DesktopSidebar } from './components/DesktopSidebar';
+import { MobileNavBar, ActiveTab } from './components/MobileNavBar';
+import { MobileMoreDrawer } from './components/MobileMoreDrawer';
+import { ImportModal } from './components/ImportModal';
+import { ExportModal } from './components/ExportModal';
+import { ReceiptDetailModal } from './components/ReceiptDetailModal';
+import { NewReceiptModal } from './components/receipts/NewReceiptModal';
+import { NewPlayerModal } from './components/admin/NewPlayerModal';
+import { SupabaseArchitectureModal } from './components/supabase/SupabaseArchitectureModal';
+import { LoginScreen } from './components/auth/LoginScreen';
+import { FraoviaWelcomeGrid } from './components/dashboard/FraoviaWelcomeGrid';
+
+// Options 2, 4, 6 Modals
+import { MedicalCenterModal } from './components/medical/MedicalCenterModal';
+import { ScholarshipsModal } from './components/scholarships/ScholarshipsModal';
+import { ParentPortalModal } from './components/portal/ParentPortalModal';
+import { OneClickPlanSelectorModal } from './components/plans/OneClickPlanSelectorModal';
+import { UserProfileModal } from './components/profile/UserProfileModal';
+import { CanvaPageEditorModal } from './components/designer/CanvaPageEditorModal';
+import { SubscriptionExpiryBanner } from './components/common/SubscriptionExpiryBanner';
+import { FeeReminderAutomationModal } from './components/admin/FeeReminderAutomationModal';
+import { ClubMindMapModal } from './components/superadmin/ClubMindMapModal';
+import { ClubProfileAndEditorModal } from './components/superadmin/ClubProfileAndEditorModal';
+
+// RBAC & Role Limits
+import { RestrictedSectorNotice } from './components/common/RestrictedSectorNotice';
+import { RolePermissionsModal } from './components/rbac/RolePermissionsModal';
+import { canRoleAccessSector } from './services/rbac';
+import { useAppTheme } from './context/ThemeContext';
+import { SuperadminSection } from './components/superadmin/superadminNavigation';
+
+// Views
+import { SuperadminDashboard } from './components/superadmin/SuperadminDashboard';
+import { BackupsManagementModule } from './components/superadmin/BackupsManagementModule';
+import { GerenteDashboard } from './components/owner/GerenteDashboard';
+import { AdminDashboard } from './components/admin/AdminDashboard';
+import { CategoriasProfesoresModule } from './components/admin/CategoriasProfesoresModule';
+import { ExecutiveAnalyticsCharts } from './components/analytics/ExecutiveAnalyticsCharts';
+import { ProfesorDashboard } from './components/coach/ProfesorDashboard';
+import { TiendaDashboard } from './components/store/TiendaDashboard';
+import { CashModule } from './components/cash/CashModule';
+import { ReceiptsModule } from './components/receipts/ReceiptsModule';
+import { ClubSettingsModule } from './components/settings/ClubSettingsModule';
+import { SeasonsModule } from './components/settings/SeasonsModule';
+import { ViajesTorneosModule } from './components/trips/ViajesTorneosModule';
+import { ModuleVisibilityModal } from './components/admin/ModuleVisibilityModal';
+
+// Icons
+import { 
+  Database, 
+  ShieldCheck, 
+  Layers, 
+  History, 
+  CheckCircle, 
+  Sparkles,
+  HeartPulse,
+  Award,
+  Sliders,
+  Zap,
+  Cloud
+} from 'lucide-react';
+import { ErrorBoundary } from './components/common/ErrorBoundary';
+
+function MainApp() {
+  const { theme } = useAppTheme();
+
+  // 1. Session & Persona Switcher state
+  const [allUsers, setAllUsers] = useState<User[]>(() => 
+    fraoviaDB.getUsers(null, { id: 'admin', role: 'SUPERADMIN' } as any)
+  );
+
+  // Authentication State
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(true);
+  const [currentUser, setCurrentUser] = useState<User>(() => allUsers[0]); // Alejandro Fraovia (Superadmin)
+  const [isSupervisingClub, setIsSupervisingClub] = useState<Club | null>(null);
+
+  // 2. Navigation State
+  const [activeTab, setActiveTab] = useState<ActiveTab>('dashboard');
+  const [isMobileMoreOpen, setIsMobileMoreOpen] = useState(false);
+  const [superadminSection, setSuperadminSection] = useState<SuperadminSection>('inicio');
+
+  // 3. Modals State
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+  const [isNewReceiptModalOpen, setIsNewReceiptModalOpen] = useState(false);
+  const [selectedPlayerForReceipt, setSelectedPlayerForReceipt] = useState<Player | null>(null);
+  const [receiptChargeType, setReceiptChargeType] = useState<ChargeType | undefined>(undefined);
+  const [isNewPlayerModalOpen, setIsNewPlayerModalOpen] = useState(false);
+  const [selectedReceiptForDetail, setSelectedReceiptForDetail] = useState<Receipt | null>(null);
+  const [isSupabaseModalOpen, setIsSupabaseModalOpen] = useState(false);
+
+  // New Modals for Options 2, 4, 6 and Plans
+  const [isMedicalModalOpen, setIsMedicalModalOpen] = useState(false);
+  const [isScholarshipsModalOpen, setIsScholarshipsModalOpen] = useState(false);
+  const [isParentPortalOpen, setIsParentPortalOpen] = useState(false);
+  const [isRbacModalOpen, setIsRbacModalOpen] = useState(false);
+  const [isPlanModalOpen, setIsPlanModalOpen] = useState(false);
+  const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
+  const [isCanvaDesignerOpen, setIsCanvaDesignerOpen] = useState(false);
+  const [isFeeReminderModalOpen, setIsFeeReminderModalOpen] = useState(false);
+  const [clubForMindMapInApp, setClubForMindMapInApp] = useState<Club | null>(null);
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(true);
+  const [clubForEditorModal, setClubForEditorModal] = useState<Club | null>(null);
+  const [isModuleVisibilityModalOpen, setIsModuleVisibilityModalOpen] = useState(false);
+
+  // Data Refresh Trigger
+  const [refreshKey, setRefreshKey] = useState(0);
+  const triggerRefresh = () => setRefreshKey(prev => prev + 1);
+
+  // FASE 1 & FASE 2: DATOS REALES SUPABASE
+  const [dbClubs, setDbClubs] = useState<Club[]>([]);
+  const [dbDisciplines, setDbDisciplines] = useState<Discipline[]>([]);
+  const [dbCategories, setDbCategories] = useState<Category[]>([]);
+  const [dbPlayers, setDbPlayers] = useState<Player[]>([]);
+  const [dbCashBoxes, setDbCashBoxes] = useState<CashBox[]>([]);
+  const [dbCashMovements, setDbCashMovements] = useState<CashMovement[]>([]);
+  const [dbReceipts, setDbReceipts] = useState<Receipt[]>([]);
+  const [dbStoreProducts, setDbStoreProducts] = useState<StoreProduct[]>([]);
+  const [dbStoreSales, setDbStoreSales] = useState<StoreSale[]>([]);
+  const [dbStorePromotions, setDbStorePromotions] = useState<StorePromotion[]>([]);
+  const [dbStoreCashBox, setDbStoreCashBox] = useState<CashBox | null>(null);
+  const [dbUsers, setDbUsers] = useState<User[]>([]);
+  const [dbSeasons, setDbSeasons] = useState<Season[]>([]);
+  const [dbTrips, setDbTrips] = useState<TripTournament[]>([]);
+  const [dbAttendance, setDbAttendance] = useState<AttendanceRecord[]>([]);
+  const [dbProvisional, setDbProvisional] = useState<{ players: ProvisionalPlayer[]; requests: CoachApprovalRequest[] }>({ players: [], requests: [] });
+  const [dataError, setDataError] = useState<string | null>(null);
+
+  // Carga inicial y reactiva de datos reales desde Supabase
+  useEffect(() => {
+    let isMounted = true;
+    if (!isSupabaseConfigured()) return;
+
+    // 1. Cargar clubes según RLS
+    supabaseDataService.getClubs(currentUser)
+      .then(clubs => {
+        if (isMounted) setDbClubs(clubs);
+      })
+      .catch(err => {
+        if (isMounted) {
+          const msg = formatSupabaseError(err);
+          setDataError(msg);
+          console.error('Error cargando clubes desde Supabase:', msg);
+        }
+      });
+
+    return () => { isMounted = false; };
+  }, [currentUser, refreshKey]);
+
+  // Computed Entities based on RLS
+  const allClubs = useMemo(() => {
+    if (isSupabaseConfigured() && dbClubs.length > 0) return dbClubs;
+    return fraoviaDB.getClubs(currentUser);
+  }, [currentUser, refreshKey, dbClubs]);
+
+  const allPlans = useMemo(() => fraoviaDB.getPlans(), [refreshKey]);
+  const allBetas = useMemo(() => fraoviaDB.getBetaFeatures(), [refreshKey]);
+
+  // Current active club:
+  const currentClub: Club | null = useMemo(() => {
+    if (currentUser.role === 'SUPERADMIN') {
+      return isSupervisingClub;
+    }
+    return allClubs.find(c => c.id === currentUser.clubId) || null;
+  }, [currentUser, isSupervisingClub, allClubs]);
+
+  // Cargar disciplinas, categorías, jugadores, cajas, movimientos y recibos reales cuando cambia currentClub
+  useEffect(() => {
+    let isMounted = true;
+    if (!isSupabaseConfigured() || !currentClub?.id) {
+      setDbDisciplines([]);
+      setDbCategories([]);
+      setDbPlayers([]);
+      setDbCashBoxes([]);
+      setDbCashMovements([]);
+      setDbReceipts([]);
+      setDbStoreProducts([]);
+      setDbStoreSales([]);
+      setDbStorePromotions([]);
+      setDbStoreCashBox(null);
+      setDbTrips([]);
+      setDbAttendance([]);
+      setDbProvisional({ players: [], requests: [] });
+      setDbUsers([]);
+      setDbSeasons([]);
+      return;
+    }
+
+    // Cada consulta carga por separado: si una falla (por ejemplo jugadores),
+    // las demás igual se muestran y el error se informa con claridad.
+    const clubId = currentClub.id;
+    // Primero se aplican los cambios de descuento por hermanos que llegaron a su fecha
+    supabaseFamilyService.applyDue().catch(() => 0).then(() => Promise.allSettled([
+      supabaseDataService.getDisciplines(clubId),
+      supabaseDataService.getCategories(clubId),
+      supabaseDataService.getPlayers(clubId),
+      supabaseDataService.getCashBoxes(clubId),
+      supabaseDataService.getCashMovements(clubId),
+      supabaseReceiptService.getReceipts(clubId),
+      supabaseStoreService.fetchProducts(clubId),
+      supabaseStoreService.fetchSales(clubId),
+      supabaseStoreService.fetchPromotions(clubId),
+      // La caja de tienda se crea/obtiene por RPC, solo permitido a DUEÑO, ADMINISTRACIÓN y TIENDA
+      (['DUEÑO', 'ADMINISTRACIÓN', 'TIENDA'].includes(currentUser?.role as string))
+        ? supabaseStoreService.getOrCreateStoreCashBox()
+        : Promise.resolve(null),
+      supabaseTripService.fetchTrips(clubId),
+      supabaseTripService.fetchAttendance(clubId),
+      supabaseDataService.getClubUsers(clubId),
+      supabaseDataService.getSeasons(clubId),
+      supabaseProvisionalService.fetchAll(clubId)
+    ])).then((results) => {
+      if (!isMounted) return;
+      const [discs, cats, plyrs, boxes, movs, recs, sProds, sSales, sPromos, sBox, trips, attn, usrs, seas, prov] = results;
+      if (discs.status === 'fulfilled') setDbDisciplines(discs.value);
+      if (cats.status === 'fulfilled') setDbCategories(cats.value);
+      if (plyrs.status === 'fulfilled') setDbPlayers(plyrs.value);
+      if (boxes.status === 'fulfilled') setDbCashBoxes(boxes.value);
+      if (movs.status === 'fulfilled') setDbCashMovements(movs.value);
+      if (recs.status === 'fulfilled') setDbReceipts(recs.value);
+      if (sProds.status === 'fulfilled') setDbStoreProducts(sProds.value);
+      if (sSales.status === 'fulfilled') setDbStoreSales(sSales.value);
+      if (sPromos.status === 'fulfilled') setDbStorePromotions(sPromos.value);
+      if (sBox.status === 'fulfilled') setDbStoreCashBox(sBox.value as CashBox | null);
+      if (trips.status === 'fulfilled') setDbTrips(trips.value);
+      if (attn.status === 'fulfilled') setDbAttendance(attn.value);
+      if (usrs.status === 'fulfilled') setDbUsers(usrs.value);
+      if (seas.status === 'fulfilled') setDbSeasons(seas.value);
+      if (prov.status === 'fulfilled') setDbProvisional(prov.value);
+
+      const names = ['disciplinas', 'categorías', 'jugadores', 'cajas', 'movimientos de caja', 'comprobantes', 'productos de tienda', 'ventas de tienda', 'promociones de tienda', 'caja de tienda', 'viajes y torneos', 'asistencia', 'usuarios del club', 'temporadas', 'listado provisorio'];
+      const failures = results
+        .map((r, i) => (r.status === 'rejected' ? `${names[i]}: ${formatSupabaseError(r.reason)}` : null))
+        .filter(Boolean) as string[];
+      if (failures.length > 0) {
+        const msg = 'No se pudieron cargar: ' + failures.join(' | ');
+        setDataError(msg);
+        console.error(msg);
+      } else {
+        setDataError(null);
+      }
+    });
+
+    return () => { isMounted = false; };
+  }, [currentClub?.id, refreshKey]);
+
+  const activePlan = useMemo(() => {
+    if (!currentClub) return null;
+    return allPlans.find(p => p.id === currentClub.subscriptionPlanId) || null;
+  }, [currentClub, allPlans]);
+
+  const seasons = useMemo(() => {
+    if (!currentClub) return [];
+    if (isSupabaseConfigured()) return dbSeasons;
+    return fraoviaDB.getSeasons(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbSeasons]);
+
+  // Usuarios del club (profesores, etc.): de Supabase si está activo, si no los locales
+  const clubUsers = useMemo(() => {
+    if (!currentClub) return [];
+    if (isSupabaseConfigured()) return dbUsers;
+    return fraoviaDB.getUsers(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbUsers]);
+
+  const currentSeason = useMemo(() => {
+    return seasons.find(s => s.status === 'activa') || seasons[0] || null;
+  }, [seasons]);
+
+  const disciplines = useMemo(() => {
+    // Con Supabase activo nunca se mezclan datos de demostración locales (sus ids no son UUID)
+    if (isSupabaseConfigured()) return dbDisciplines;
+    if (!currentClub) return [];
+    return fraoviaDB.getDisciplines(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbDisciplines]);
+
+  const categories = useMemo(() => {
+    if (isSupabaseConfigured()) return dbCategories;
+    if (!currentClub) return [];
+    return fraoviaDB.getCategories(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbCategories]);
+
+  const players = useMemo(() => {
+    if (isSupabaseConfigured()) {
+      // Marca a los deportistas recién cargados que todavía no pagaron nada (no deben verse "Al día")
+      return dbPlayers.map(p => ({ ...p, pendingFirstPayment: isPendingFirstPayment(p, dbReceipts) }));
+    }
+    if (!currentClub) return [];
+    return fraoviaDB.getPlayers(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbPlayers, dbDisciplines, dbReceipts]);
+
+  const cashBoxes = useMemo(() => {
+    if (isSupabaseConfigured()) return dbCashBoxes;
+    if (!currentClub) return [];
+    return fraoviaDB.getCashBoxes(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbCashBoxes]);
+
+  const cashMovements = useMemo(() => {
+    if (isSupabaseConfigured()) return dbCashMovements;
+    if (!currentClub) return [];
+    return fraoviaDB.getCashMovements(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbCashMovements]);
+
+  const receipts = useMemo(() => {
+    if (isSupabaseConfigured()) return dbReceipts;
+    if (!currentClub) return [];
+    return fraoviaDB.getReceipts(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbReceipts]);
+
+  const storeProducts = useMemo(() => {
+    if (!currentClub) return [];
+    if (isSupabaseConfigured()) return dbStoreProducts;
+    return fraoviaDB.getStoreProducts(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbStoreProducts]);
+
+  const storeSales = useMemo(() => {
+    if (!currentClub) return [];
+    if (isSupabaseConfigured()) return dbStoreSales;
+    return fraoviaDB.getStoreSales(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbStoreSales]);
+
+  const auditLogs = useMemo(() => {
+    return fraoviaDB.getAuditLogs(currentUser, currentClub?.id);
+  }, [currentUser, currentClub, refreshKey]);
+
+  const attendanceRecords = useMemo(() => {
+    if (!currentClub) return [];
+    if (isSupabaseConfigured()) return dbAttendance;
+    return fraoviaDB.getAttendanceRecords(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbAttendance]);
+
+  const provisionalPlayers = useMemo(() => {
+    if (!currentClub) return [];
+    if (isSupabaseConfigured()) return dbProvisional.players;
+    return fraoviaDB.getProvisionalPlayers(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbProvisional]);
+
+  const coachRequests = useMemo(() => {
+    if (!currentClub) return [];
+    if (isSupabaseConfigured()) return dbProvisional.requests;
+    return fraoviaDB.getCoachApprovalRequests(currentClub.id, currentUser);
+  }, [currentClub, currentUser, refreshKey, dbProvisional]);
+
+  // Session Handlers
+  // Dynamic Club Stylesheet & CSS Variables Injection (from club.branding)
+  useEffect(() => {
+    if (!currentClub?.branding) {
+      const existingStyle = document.getElementById('fraovia-club-custom-css');
+      if (existingStyle) existingStyle.textContent = '';
+      return;
+    }
+
+    const { primaryColor, secondaryColor, accentColor, backgroundColor, customCss, cssEnabled, boxCustomStyles } = currentClub.branding;
+    const root = document.documentElement;
+
+    if (primaryColor) root.style.setProperty('--club-primary', primaryColor);
+    if (secondaryColor) root.style.setProperty('--club-secondary', secondaryColor);
+    if (accentColor) root.style.setProperty('--club-accent', accentColor);
+    if (backgroundColor) root.style.setProperty('--club-bg', backgroundColor);
+
+    let styleEl = document.getElementById('fraovia-club-custom-css') as HTMLStyleElement;
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = 'fraovia-club-custom-css';
+      document.head.appendChild(styleEl);
+    }
+
+    let dynamicRules = '';
+    if (boxCustomStyles) {
+      if (boxCustomStyles.fondo_general?.bgColor) {
+        dynamicRules += `body, .app-root-bg { background-color: ${boxCustomStyles.fondo_general.bgColor} !important; }\n`;
+      }
+      if (boxCustomStyles.cabecera) {
+        const c = boxCustomStyles.cabecera;
+        dynamicRules += `.banner-principal { border-radius: ${c.borderRadius || 24}px !important; border-width: ${c.borderWidth || 0}px !important; border-color: ${c.borderColor || 'transparent'} !important; }\n`;
+      }
+      if (boxCustomStyles.tarjeta_1) {
+        const t = boxCustomStyles.tarjeta_1;
+        dynamicRules += `.card-socio, .card-modulo { border-radius: ${t.borderRadius || 16}px !important; border-width: ${t.borderWidth || 1}px !important; border-color: ${t.borderColor || 'rgba(255,255,255,0.1)'} !important; }\n`;
+      }
+    }
+
+    if (cssEnabled && customCss) {
+      styleEl.textContent = dynamicRules + '\n' + customCss;
+    } else {
+      styleEl.textContent = dynamicRules;
+    }
+  }, [currentClub?.id, currentClub?.branding, refreshKey]);
+
+  const handleLogin = (user: User) => {
+    setCurrentUser(user);
+    if (user.role === 'SUPERADMIN') {
+      setIsSupervisingClub(null);
+    } else {
+      const club = allClubs.find(c => c.id === user.clubId);
+      setIsSupervisingClub(club || null);
+    }
+    setIsAuthenticated(true);
+    setActiveTab('dashboard');
+    triggerRefresh();
+  };
+
+  const handleLogout = () => {
+    setIsAuthenticated(false);
+  };
+
+  const handleSwitchUser = (user: User) => {
+    handleLogin(user);
+  };
+
+  const handleSelectClubToSupervise = (club: Club) => {
+    setIsSupervisingClub(club);
+    setActiveTab('dashboard');
+  };
+
+  const handleExitSupervision = () => {
+    setIsSupervisingClub(null);
+    setActiveTab('dashboard');
+  };
+
+  // If not logged in, render exact Login Screen
+  if (!isAuthenticated) {
+    return (
+      <>
+        <LoginScreen
+          onLogin={handleLogin}
+          availableUsers={allUsers}
+          onOpenParentPortal={() => setIsParentPortalOpen(true)}
+        />
+        {/* Parent Portal Modal accessible from Login Screen */}
+        <ParentPortalModal
+          isOpen={isParentPortalOpen}
+          onClose={() => setIsParentPortalOpen(false)}
+          allClubs={allClubs}
+          allPlayers={fraoviaDB.getPlayers(allClubs[0]?.id || '', { id: 'a', role: 'SUPERADMIN' } as any)}
+          allReceipts={fraoviaDB.getReceipts(allClubs[0]?.id || '', { id: 'a', role: 'SUPERADMIN' } as any)}
+          categories={fraoviaDB.getCategories(allClubs[0]?.id || '', { id: 'a', role: 'SUPERADMIN' } as any)}
+          onSelectReceipt={(rec) => setSelectedReceiptForDetail(rec)}
+        />
+      </>
+    );
+  }
+
+  // Determine which dashboard to render
+  const renderMainContent = () => {
+    // 1. If SuperAdmin and not supervising a specific club:
+    if (currentUser.role === 'SUPERADMIN' && !isSupervisingClub) {
+      return (
+        <SuperadminDashboard
+          currentUser={currentUser}
+          allClubs={allClubs}
+          allPlans={allPlans}
+          allBetas={allBetas}
+          auditLogs={auditLogs}
+          onSelectClubToSupervise={handleSelectClubToSupervise}
+          onRefreshData={triggerRefresh}
+          currentSection={superadminSection}
+          onSectionChange={setSuperadminSection}
+          onNavigate={setActiveTab}
+        />
+      );
+    }
+
+    // 2. Club-level views:
+    if (!currentClub) {
+      return (
+        <div className="p-8 text-center text-slate-400">
+          Seleccione una institución deportiva para comenzar.
+        </div>
+      );
+    }
+
+    switch (activeTab) {
+      case 'dashboard':
+        if (currentUser.role === 'PROFESOR') {
+          return (
+            <ProfesorDashboard
+              currentClub={currentClub}
+              currentUser={currentUser}
+              disciplines={disciplines}
+              categories={categories}
+              players={players}
+              attendanceRecords={attendanceRecords}
+              onAttendanceSaved={triggerRefresh}
+              provisionalPlayers={provisionalPlayers}
+              coachRequests={coachRequests}
+            />
+          );
+        }
+        if (currentUser.role === 'TIENDA') {
+          return (
+            <TiendaDashboard
+              currentClub={currentClub}
+              currentUser={currentUser}
+              products={storeProducts}
+              sales={storeSales}
+              promotions={dbStorePromotions}
+              storeCashBox={dbStoreCashBox}
+              players={players}
+              receipts={receipts}
+              onRefreshData={triggerRefresh}
+              onSaleCompleted={(rec) => {
+                setSelectedReceiptForDetail(rec);
+                triggerRefresh();
+              }}
+            />
+          );
+        }
+
+        // For DUEÑO / GENERAL:
+        if (currentUser.role === 'DUEÑO' || currentUser.role === 'GENERAL') {
+          return (
+            <GerenteDashboard
+              currentClub={currentClub}
+              currentUser={currentUser}
+              activePlan={activePlan}
+              players={players}
+              movements={cashMovements}
+              sales={storeSales}
+              receipts={receipts}
+              onNavigate={setActiveTab}
+              onOpenPlanSelector={() => setIsPlanModalOpen(true)}
+              onOpenMedicalCenter={() => setIsMedicalModalOpen(true)}
+            />
+          );
+        }
+
+        // For ADMINISTRACIÓN:
+        return (
+          <AdminDashboard
+            currentClub={currentClub}
+            currentUser={currentUser}
+            players={players}
+            receipts={receipts}
+            disciplines={disciplines}
+            categories={categories}
+            cashBoxes={cashBoxes}
+            trips={dbTrips}
+            clubUsers={clubUsers}
+            coachRequests={coachRequests}
+            attendanceRecords={attendanceRecords}
+            onOpenNewPlayerModal={() => setIsNewPlayerModalOpen(true)}
+            onOpenNewReceiptModal={(player) => {
+              setSelectedPlayerForReceipt(player || null);
+              setIsNewReceiptModalOpen(true);
+            }}
+            onSelectReceipt={(r) => setSelectedReceiptForDetail(r)}
+            onNavigate={setActiveTab}
+            onRefreshData={triggerRefresh}
+          />
+        );
+
+      case 'planes':
+        // ONLY DUEÑO or SUPERADMIN can view or manage plans!
+        if (currentUser.role !== 'DUEÑO' && currentUser.role !== 'SUPERADMIN') {
+          return (
+            <RestrictedSectorNotice
+              attemptedSectorName="Gestión de Plan y Suscripción del Club"
+              currentUser={currentUser}
+              onBackToAllowed={() => setActiveTab('dashboard')}
+            />
+          );
+        }
+        return (
+          <div className="space-y-6">
+            <div className="p-5 rounded-2xl border border-sky-500/30 bg-[#0C162D] space-y-4">
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
+                <div className="flex items-center gap-2.5">
+                  <div className="p-2 rounded-xl bg-sky-500/10 text-sky-400 border border-sky-500/20">
+                    <Zap className="w-5 h-5 fill-current" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-bold text-white">Mi Plan Contratado · {currentClub.name}</h3>
+                    <p className="text-xs text-slate-400">Exclusivo para la Presidencia / Dueño del Club</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setIsPlanModalOpen(true)}
+                  className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white font-bold rounded-xl text-xs transition cursor-pointer flex items-center gap-1.5 shadow"
+                >
+                  <Zap className="w-4 h-4 fill-current" />
+                  <span>Modificar Plan a 1 Clic</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-1">
+                <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-1">
+                  <span className="text-[10px] text-slate-400 uppercase font-bold block">Plan Actual</span>
+                  <div className="text-2xl font-black text-sky-400 font-mono">{activePlan?.name || 'PRO'}</div>
+                  <span className="text-[11px] text-slate-300 font-medium">Facturación mensual oficial</span>
+                </div>
+
+                <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-1">
+                  <span className="text-[10px] text-slate-400 uppercase font-bold block">Cupo de Deportistas</span>
+                  <div className="text-2xl font-black text-white font-mono">{players.length} / {currentClub.contractedPlayersQuota || 800}</div>
+                  <span className="text-[11px] text-emerald-400 font-medium">Fichas activas federadas</span>
+                </div>
+
+                <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-1">
+                  <span className="text-[10px] text-slate-400 uppercase font-bold block">Importe Mensual</span>
+                  <div className="text-2xl font-black text-white font-mono">${(activePlan?.monthlyPrice || 89000).toLocaleString('es-AR')}</div>
+                  <span className="text-[11px] text-slate-400 font-medium">Suscripción SaaS</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+
+      case 'jugadores':
+        if (!canRoleAccessSector(currentUser.role, 'jugadores_padron')) {
+          return (
+            <RestrictedSectorNotice
+              attemptedSectorName="Padrón de Jugadores & Fichas"
+              currentUser={currentUser}
+              onBackToAllowed={() => setActiveTab('dashboard')}
+            />
+          );
+        }
+        return (
+          <AdminDashboard
+            currentClub={currentClub}
+            currentUser={currentUser}
+            players={players}
+            receipts={receipts}
+            disciplines={disciplines}
+            categories={categories}
+            initialViewTab="padron"
+            clubUsers={clubUsers}
+            coachRequests={coachRequests}
+            attendanceRecords={attendanceRecords}
+            onOpenNewPlayerModal={() => setIsNewPlayerModalOpen(true)}
+            onOpenNewReceiptModal={(player) => {
+              setSelectedPlayerForReceipt(player || null);
+              setIsNewReceiptModalOpen(true);
+            }}
+            onSelectReceipt={(r) => setSelectedReceiptForDetail(r)}
+            onNavigate={setActiveTab}
+            onRefreshData={triggerRefresh}
+          />
+        );
+
+      case 'categorias_profesores':
+        if (!canRoleAccessSector(currentUser.role, 'jugadores_padron')) {
+          return (
+            <RestrictedSectorNotice
+              attemptedSectorName="Categorías & Profesores del Club"
+              currentUser={currentUser}
+              onBackToAllowed={() => setActiveTab('dashboard')}
+            />
+          );
+        }
+        return (
+          <CategoriasProfesoresModule
+            currentClub={currentClub}
+            currentUser={currentUser}
+            disciplines={disciplines}
+            categories={categories}
+            players={players}
+            clubUsers={clubUsers}
+            onRefreshData={triggerRefresh}
+            onOpenNewPlayerModal={() => setIsNewPlayerModalOpen(true)}
+            onOpenNewReceiptModal={() => setIsNewReceiptModalOpen(true)}
+          />
+        );
+
+      case 'asistencia':
+        if (!canRoleAccessSector(currentUser.role, 'asistencia_deportiva')) {
+          return (
+            <RestrictedSectorNotice
+              attemptedSectorName="Asistencia Deportiva en Cancha"
+              currentUser={currentUser}
+              onBackToAllowed={() => setActiveTab('dashboard')}
+            />
+          );
+        }
+        return (
+          <ProfesorDashboard
+            currentClub={currentClub}
+            currentUser={currentUser}
+            disciplines={disciplines}
+            categories={categories}
+            players={players}
+            attendanceRecords={attendanceRecords}
+            onAttendanceSaved={triggerRefresh}
+            provisionalPlayers={provisionalPlayers}
+            coachRequests={coachRequests}
+          />
+        );
+
+      case 'caja':
+        if (!canRoleAccessSector(currentUser.role, 'caja_tesoreria')) {
+          return (
+            <RestrictedSectorNotice
+              attemptedSectorName="Tesorería y Caja General"
+              currentUser={currentUser}
+              onBackToAllowed={() => setActiveTab('dashboard')}
+            />
+          );
+        }
+        return (
+          <CashModule
+            currentClub={currentClub}
+            currentUser={currentUser}
+            cashBoxes={cashBoxes}
+            movements={cashMovements}
+            onMovementAdded={triggerRefresh}
+            onOpenNewReceipt={() => setIsNewReceiptModalOpen(true)}
+          />
+        );
+
+      case 'viajes':
+        if (!canRoleAccessSector(currentUser.role, 'viajes_torneos')) {
+          return (
+            <RestrictedSectorNotice
+              attemptedSectorName="Giras, Viajes & Torneos"
+              currentUser={currentUser}
+              onBackToAllowed={() => setActiveTab('dashboard')}
+            />
+          );
+        }
+        return (
+          <ViajesTorneosModule
+            currentClub={currentClub}
+            currentUser={currentUser}
+            categories={categories}
+            players={players}
+            cashBoxes={cashBoxes}
+            trips={dbTrips}
+            onRefreshData={triggerRefresh}
+            onOpenReceiptDetail={(r) => setSelectedReceiptForDetail(r)}
+          />
+        );
+
+      case 'comprobantes':
+        if (!canRoleAccessSector(currentUser.role, 'comprobantes')) {
+          return (
+            <RestrictedSectorNotice
+              attemptedSectorName="Comprobantes Oficiales"
+              currentUser={currentUser}
+              onBackToAllowed={() => setActiveTab('dashboard')}
+            />
+          );
+        }
+        return (
+          <ReceiptsModule
+            currentClub={currentClub}
+            currentUser={currentUser}
+            receipts={receipts}
+            onSelectReceipt={(r) => setSelectedReceiptForDetail(r)}
+            onOpenNewReceiptModal={() => setIsNewReceiptModalOpen(true)}
+          />
+        );
+
+      case 'tienda':
+        if (!canRoleAccessSector(currentUser.role, 'tienda_pos')) {
+          return (
+            <RestrictedSectorNotice
+              attemptedSectorName="Tienda Oficial & Punto de Venta"
+              currentUser={currentUser}
+              onBackToAllowed={() => setActiveTab('dashboard')}
+            />
+          );
+        }
+        return (
+          <TiendaDashboard
+            currentClub={currentClub}
+            currentUser={currentUser}
+            products={storeProducts}
+            sales={storeSales}
+            promotions={dbStorePromotions}
+            storeCashBox={dbStoreCashBox}
+            players={players}
+            receipts={receipts}
+            initialTab="pos"
+            onSaleCompleted={(rec) => {
+              setSelectedReceiptForDetail(rec);
+              triggerRefresh();
+            }}
+            onRefreshData={triggerRefresh}
+          />
+        );
+
+      case 'tienda_analisis':
+        if (!canRoleAccessSector(currentUser.role, 'tienda_pos')) {
+          return (
+            <RestrictedSectorNotice
+              attemptedSectorName="Análisis de Ventas de Tienda"
+              currentUser={currentUser}
+              onBackToAllowed={() => setActiveTab('dashboard')}
+            />
+          );
+        }
+        return (
+          <TiendaDashboard
+            currentClub={currentClub}
+            currentUser={currentUser}
+            products={storeProducts}
+            sales={storeSales}
+            promotions={dbStorePromotions}
+            storeCashBox={dbStoreCashBox}
+            players={players}
+            receipts={receipts}
+            initialTab="resumen"
+            onSaleCompleted={(rec) => {
+              setSelectedReceiptForDetail(rec);
+              triggerRefresh();
+            }}
+            onRefreshData={triggerRefresh}
+          />
+        );
+
+      case 'configuracion':
+        if (currentUser.role !== 'SUPERADMIN') {
+          return (
+            <RestrictedSectorNotice
+              attemptedSectorName="Configuración de Identidad y Diseño Visual del Club"
+              currentUser={currentUser}
+              onBackToAllowed={() => setActiveTab('dashboard')}
+            />
+          );
+        }
+        return (
+          <ClubSettingsModule
+            currentClub={currentClub}
+            currentUser={currentUser}
+            onBrandingUpdated={triggerRefresh}
+          />
+        );
+
+      case 'temporadas':
+        return (
+          <SeasonsModule
+            currentClub={currentClub}
+            currentUser={currentUser}
+            seasons={seasons}
+            onSeasonsUpdated={triggerRefresh}
+          />
+        );
+
+      case 'auditoria':
+        return (
+          <div className="bg-white dark:bg-[#0C162D] border border-slate-200 dark:border-[#1B2B4C] rounded-2xl p-5 space-y-4 shadow-sm">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-slate-800">
+              <div className="flex items-center gap-2">
+                <History className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+                <h3 className="font-extrabold text-slate-900 dark:text-slate-100 text-sm">
+                  Bitácora de Auditoría · {currentClub.name}
+                </h3>
+              </div>
+              <span className="text-xs text-slate-600 dark:text-slate-400 font-mono font-bold bg-slate-100 dark:bg-slate-900 px-2.5 py-1 rounded-full border border-slate-200 dark:border-slate-800">
+                {auditLogs.length} eventos registrados
+              </span>
+            </div>
+
+            <div className="overflow-x-auto max-h-96 border border-slate-200 dark:border-[#16233E] rounded-xl bg-white dark:bg-transparent">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-100 dark:bg-[#070D1E] text-slate-700 dark:text-slate-300 font-bold border-b border-slate-200 dark:border-slate-800">
+                  <tr>
+                    <th className="p-3">Fecha y Hora</th>
+                    <th className="p-3">Usuario</th>
+                    <th className="p-3">Rol</th>
+                    <th className="p-3">Acción</th>
+                    <th className="p-3">Detalle</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 dark:divide-[#16233E] text-slate-800 dark:text-slate-300">
+                  {auditLogs.map((log) => (
+                    <tr key={log.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/40 transition">
+                      <td className="p-3 font-mono text-[11px] text-slate-600 dark:text-slate-400 font-medium whitespace-nowrap">
+                        {new Date(log.timestamp).toLocaleString('es-AR')}
+                      </td>
+                      <td className="p-3 font-bold text-slate-900 dark:text-slate-100">{log.userName}</td>
+                      <td className="p-3">
+                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 border border-blue-200 font-bold dark:bg-blue-500/20 dark:text-blue-300 dark:border-blue-500/30">
+                          {log.role}
+                        </span>
+                      </td>
+                      <td className="p-3 font-bold text-blue-700 dark:text-blue-400 font-mono text-[11px]">{log.action}</td>
+                      <td className="p-3 text-slate-700 dark:text-slate-300 max-w-sm truncate font-medium">{log.detail}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+
+      case 'superadmin_clubes':
+        return (
+          <SuperadminDashboard
+            currentUser={currentUser}
+            allClubs={allClubs}
+            allPlans={allPlans}
+            allBetas={allBetas}
+            auditLogs={auditLogs}
+            onSelectClubToSupervise={handleSelectClubToSupervise}
+            onRefreshData={triggerRefresh}
+            initialSubTab="clubes"
+            onNavigate={setActiveTab}
+          />
+        );
+
+      case 'superadmin_planes':
+        return (
+          <SuperadminDashboard
+            currentUser={currentUser}
+            allClubs={allClubs}
+            allPlans={allPlans}
+            allBetas={allBetas}
+            auditLogs={auditLogs}
+            onSelectClubToSupervise={handleSelectClubToSupervise}
+            onRefreshData={triggerRefresh}
+            initialSubTab="planes"
+            onNavigate={setActiveTab}
+          />
+        );
+
+      case 'superadmin_backups':
+        return (
+          <SuperadminDashboard
+            currentUser={currentUser}
+            allClubs={allClubs}
+            allPlans={allPlans}
+            allBetas={allBetas}
+            auditLogs={auditLogs}
+            onSelectClubToSupervise={handleSelectClubToSupervise}
+            onRefreshData={triggerRefresh}
+            initialSubTab="backups"
+            onNavigate={setActiveTab}
+          />
+        );
+
+      case 'superadmin_betas':
+        return (
+          <SuperadminDashboard
+            currentUser={currentUser}
+            allClubs={allClubs}
+            allPlans={allPlans}
+            allBetas={allBetas}
+            auditLogs={auditLogs}
+            onSelectClubToSupervise={handleSelectClubToSupervise}
+            onRefreshData={triggerRefresh}
+            initialSubTab="betas"
+          />
+        );
+
+      default:
+        return null;
+    }
+  };
+
+  return (
+    <div className={`min-h-screen flex flex-col font-sans transition-colors duration-200 relative ${
+      theme === 'light' ? 'bg-[#F8FAFC] text-slate-900' : 'bg-[#070D1E] text-slate-100'
+    }`}>
+      {/* Translucent Club Background Photo / Watermark with regulable opacity and blur */}
+      {currentClub && (currentClub.branding?.bgImageUrl || currentClub.branding?.watermarkUrl || currentClub.branding?.coverUrl || currentClub.logoUrl) && (
+        <div 
+          className="fixed inset-0 pointer-events-none select-none z-0 overflow-hidden transition-all duration-500"
+          style={{ 
+            opacity: theme === 'light' 
+              ? Math.min(0.06, (currentClub.branding?.bgImageOpacity ?? currentClub.branding?.watermarkOpacity ?? 0.12) * 0.45)
+              : (currentClub.branding?.bgImageOpacity ?? currentClub.branding?.watermarkOpacity ?? 0.12),
+            backgroundImage: `url(${currentClub.branding?.bgImageUrl || currentClub.branding?.watermarkUrl || currentClub.branding?.coverUrl || currentClub.logoUrl})`,
+            backgroundPosition: 'center',
+            backgroundRepeat: 'no-repeat',
+            backgroundSize: currentClub.branding?.bgImageUrl ? 'cover' : '45%',
+            filter: `blur(${currentClub.branding?.bgImageBlur || 0}px)`
+          }}
+          aria-hidden="true"
+        />
+      )}
+
+      {/* Top Header */}
+      <Header
+        currentUser={currentUser}
+        currentClub={currentClub}
+        currentSeason={currentSeason}
+        allUsers={allUsers}
+        allClubs={allClubs}
+        onSwitchUser={handleSwitchUser}
+        onExitSupervision={handleExitSupervision}
+        isSupervising={!!isSupervisingClub && currentUser.role === 'SUPERADMIN'}
+        onOpenMobileMenu={() => setIsMobileMoreOpen(true)}
+        isMobileMenuOpen={isMobileMoreOpen}
+        onLogout={handleLogout}
+        onOpenParentPortal={() => setIsParentPortalOpen(true)}
+        onOpenProfileModal={() => setIsProfileModalOpen(true)}
+        onOpenCanvaDesigner={() => setIsCanvaDesignerOpen(true)}
+        onOpenClubEditor={() => setClubForEditorModal(currentClub)}
+        onOpenFeeReminderModal={() => setIsFeeReminderModalOpen(true)}
+        onOpenNewReceiptModal={() => {
+          if (currentUser.role === 'SUPERADMIN') {
+            alert('El modo fantasma del SUPERADMIN es estrictamente de solo lectura. No se pueden emitir comprobantes.');
+            return;
+          }
+          setIsNewReceiptModalOpen(true);
+        }}
+        onOpenModuleVisibility={() => setIsModuleVisibilityModalOpen(true)}
+      />
+
+      {/* Modo Fantasma Banner de Solo Lectura para SUPERADMIN */}
+      {currentUser.role === 'SUPERADMIN' && isSupervisingClub && (
+        <div className="bg-amber-500/15 border-b border-amber-500/30 px-4 py-2.5 text-xs flex items-center justify-between text-amber-300">
+          <div className="flex items-center gap-2.5">
+            <span className="px-2 py-0.5 rounded font-black bg-amber-500/25 text-amber-300 border border-amber-500/40 text-[10px] tracking-wider uppercase">
+              Modo Fantasma (Solo Lectura)
+            </span>
+            <span>
+              Estás supervisando <strong>{isSupervisingClub.name}</strong> en modo auditoría global. Por diseño de seguridad RLS, la emisión de recibos, registro de movimientos y modificaciones operativas están bloqueadas.
+            </span>
+          </div>
+          <button
+            onClick={handleExitSupervision}
+            className="px-3 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 text-xs font-bold transition cursor-pointer"
+          >
+            Salir de supervisión
+          </button>
+        </div>
+      )}
+
+      {/* Banner de Error de Base de Datos Supabase (si empieza con FRAOVIA:) */}
+      {dataError && (
+        <div className="bg-rose-950/80 border-b border-rose-500/50 px-4 py-2.5 text-xs flex items-center justify-between text-rose-200">
+          <div className="flex items-center gap-2">
+            <span className="font-bold">Aviso del Servidor:</span>
+            <span>{dataError}</span>
+          </div>
+          <button
+            onClick={() => setDataError(null)}
+            className="px-2 py-0.5 rounded bg-rose-900/50 hover:bg-rose-800 text-rose-200 text-xs"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* Superadmin Subscription Expiry Warning Banner (Cuenta Regresiva o Cartel) */}
+      <SubscriptionExpiryBanner
+        currentClub={currentClub}
+        currentUser={currentUser}
+      />
+
+      {/* Main Container - FULL SCREEN 100% WITH COLLAPSIBLE STICKY SIDEBAR */}
+      <div className="flex-1 flex w-full relative">
+        {/* Desktop Left Sidebar with Collapse Capability & Fixed Sticky Positioning */}
+        <div className="hidden md:block sticky top-16 h-[calc(100vh-4rem)] z-20 shrink-0 self-start">
+          <DesktopSidebar
+            activeTab={activeTab}
+            onSelectTab={setActiveTab}
+            currentUser={currentUser}
+            currentClub={currentClub}
+            allClubs={allClubs}
+            onSelectClubToSupervise={handleSelectClubToSupervise}
+            onExitSupervision={handleExitSupervision}
+            onOpenClubMindMap={setClubForMindMapInApp}
+            activePlan={activePlan}
+            playerCount={players.length}
+            onOpenMedicalCenter={() => setIsMedicalModalOpen(true)}
+            onOpenScholarships={() => setIsScholarshipsModalOpen(true)}
+            onOpenSupabaseModal={() => setIsSupabaseModalOpen(true)}
+            isCollapsed={isSidebarCollapsed}
+            onToggleCollapse={() => setIsSidebarCollapsed(prev => !prev)}
+            superadminSection={superadminSection}
+            onSelectSuperadminSection={setSuperadminSection}
+          />
+        </div>
+
+        {/* Content Body */}
+        <main className="flex-1 p-3 sm:p-6 lg:p-8 pb-24 md:pb-12 overflow-x-hidden">
+          {/* Render Active View */}
+          {renderMainContent()}
+        </main>
+      </div>
+
+      {/* Mobile Bottom Navigation Bar (< 768px) */}
+      <MobileNavBar
+        activeTab={activeTab}
+        onSelectTab={setActiveTab}
+        userRole={currentUser.role}
+        onOpenMoreMenu={() => setIsMobileMoreOpen(true)}
+        hasStoreModule={currentUser.role === 'SUPERADMIN' || !!currentClub?.activeModules.tienda}
+        hasCashModule={currentUser.role === 'SUPERADMIN' || !!currentClub?.activeModules.caja}
+      />
+
+      {/* Mobile "Más" Bottom Drawer */}
+      <MobileMoreDrawer
+        isOpen={isMobileMoreOpen}
+        onClose={() => setIsMobileMoreOpen(false)}
+        currentUser={currentUser}
+        currentClub={currentClub}
+        onSelectTab={setActiveTab}
+        onOpenImport={() => setIsImportModalOpen(true)}
+        onOpenExport={() => setIsExportModalOpen(true)}
+        onOpenModuleVisibility={() => setIsModuleVisibilityModalOpen(true)}
+      />
+
+      {/* Modals */}
+      {currentClub && (
+        <>
+          <ImportModal
+            isOpen={isImportModalOpen}
+            onClose={() => setIsImportModalOpen(false)}
+            currentClub={currentClub}
+            currentUser={currentUser}
+            disciplines={disciplines}
+            categories={categories}
+            existingPlayers={players}
+            onImportComplete={triggerRefresh}
+          />
+
+          <ExportModal
+            isOpen={isExportModalOpen}
+            onClose={() => setIsExportModalOpen(false)}
+            currentClub={currentClub}
+            currentUser={currentUser}
+            players={players}
+            receipts={receipts}
+            movements={cashMovements}
+          />
+
+          <NewPlayerModal
+            isOpen={isNewPlayerModalOpen}
+            onClose={() => setIsNewPlayerModalOpen(false)}
+            currentClub={currentClub}
+            currentUser={currentUser}
+            disciplines={disciplines}
+            categories={categories}
+            onPlayerAdded={triggerRefresh}
+            onChargeNewPlayer={(player, type) => {
+              setSelectedPlayerForReceipt(player);
+              setReceiptChargeType(type);
+              setIsNewReceiptModalOpen(true);
+            }}
+          />
+
+          <NewReceiptModal
+            isOpen={isNewReceiptModalOpen}
+            onClose={() => {
+              setIsNewReceiptModalOpen(false);
+              setSelectedPlayerForReceipt(null);
+              setReceiptChargeType(undefined);
+            }}
+            currentClub={currentClub}
+            currentUser={currentUser}
+            cashBoxes={cashBoxes}
+            players={players}
+            categories={categories}
+            receipts={receipts}
+            initialPlayer={selectedPlayerForReceipt}
+            initialChargeType={receiptChargeType}
+            onReceiptCreated={(rec) => {
+              setSelectedReceiptForDetail(rec);
+              setSelectedPlayerForReceipt(null);
+              setReceiptChargeType(undefined);
+              triggerRefresh();
+            }}
+          />
+
+          <ReceiptDetailModal
+            isOpen={!!selectedReceiptForDetail}
+            receipt={selectedReceiptForDetail}
+            onClose={() => setSelectedReceiptForDetail(null)}
+            currentClub={currentClub}
+            currentUser={currentUser}
+            onReceiptUpdated={triggerRefresh}
+          />
+
+          {/* Opción 2: Medical Center Modal */}
+          <MedicalCenterModal
+            isOpen={isMedicalModalOpen}
+            onClose={() => setIsMedicalModalOpen(false)}
+            currentClub={currentClub}
+            currentUser={currentUser}
+            players={players}
+            onPlayerUpdated={triggerRefresh}
+            onRequestMedicalCharge={(player) => {
+              // Renovar el apto médico se cobra y emite comprobante
+              setSelectedPlayerForReceipt(player);
+              setReceiptChargeType('ficha_medica');
+              setIsNewReceiptModalOpen(true);
+            }}
+          />
+
+          {/* Opción 4: Scholarships & Siblings Modal */}
+          <ScholarshipsModal
+            isOpen={isScholarshipsModalOpen}
+            onClose={() => setIsScholarshipsModalOpen(false)}
+            currentClub={currentClub}
+            currentUser={currentUser}
+            players={players}
+            onRulesUpdated={triggerRefresh}
+          />
+        </>
+      )}
+
+      {/* Opción 6: Parent Portal Modal */}
+      <ParentPortalModal
+        isOpen={isParentPortalOpen}
+        onClose={() => setIsParentPortalOpen(false)}
+        allClubs={allClubs}
+        allPlayers={currentClub ? players : fraoviaDB.getPlayers(allClubs[0]?.id || '', { id: 'a', role: 'SUPERADMIN' } as any)}
+        allReceipts={currentClub ? receipts : fraoviaDB.getReceipts(allClubs[0]?.id || '', { id: 'a', role: 'SUPERADMIN' } as any)}
+        categories={currentClub ? categories : fraoviaDB.getCategories(allClubs[0]?.id || '', { id: 'a', role: 'SUPERADMIN' } as any)}
+        onSelectReceipt={(rec) => setSelectedReceiptForDetail(rec)}
+      />
+
+      {/* Supabase Architecture & RLS Matrix Modal */}
+      <SupabaseArchitectureModal
+        isOpen={isSupabaseModalOpen}
+        onClose={() => setIsSupabaseModalOpen(false)}
+        allClubs={allClubs}
+        allUsers={allUsers}
+      />
+
+      {/* Role Limitations & RBAC Modal */}
+      <RolePermissionsModal
+        isOpen={isRbacModalOpen}
+        onClose={() => setIsRbacModalOpen(false)}
+        currentRole={currentUser.role}
+      />
+
+      {/* Selector & Constructor de Planes a 1 Clic */}
+      {currentClub && (
+        <OneClickPlanSelectorModal
+          isOpen={isPlanModalOpen}
+          onClose={() => setIsPlanModalOpen(false)}
+          currentClub={currentClub}
+          currentUser={currentUser}
+          allPlans={allPlans}
+          onPlanUpdated={triggerRefresh}
+        />
+      )}
+
+      {/* User Profile & Icon Manager Modal */}
+      <UserProfileModal
+        isOpen={isProfileModalOpen}
+        onClose={() => setIsProfileModalOpen(false)}
+        currentUser={currentUser}
+        allClubs={allClubs}
+        currentClub={currentClub}
+        onUserUpdated={async (updatedUser) => {
+          try {
+            const saved = await dataActions.updateOwnProfile(updatedUser, currentUser);
+            setCurrentUser(saved);
+            triggerRefresh();
+          } catch (err: any) {
+            alert(err.message || 'No se pudo guardar el perfil.');
+          }
+        }}
+        onClubUpdated={triggerRefresh}
+      />
+
+      {/* Visual Canva-Style Page Editor & Template Importer (Solo para mí) */}
+      {currentClub && (
+        <CanvaPageEditorModal
+          isOpen={isCanvaDesignerOpen}
+          onClose={() => setIsCanvaDesignerOpen(false)}
+          currentClub={currentClub}
+          currentUser={currentUser}
+          onApplyTemplate={triggerRefresh}
+        />
+      )}
+
+      {/* Fee Reminder Automation Modal (Cobranzas y Vencimiento al Iniciar el Mes) */}
+      {isFeeReminderModalOpen && currentClub && (
+        <FeeReminderAutomationModal
+          isOpen={isFeeReminderModalOpen}
+          onClose={() => setIsFeeReminderModalOpen(false)}
+          currentClub={currentClub}
+          currentUser={currentUser}
+          onUpdated={triggerRefresh}
+        />
+      )}
+
+      {/* Global Club Mind Map Modal (Accesible desde sidebar y panel) */}
+      {clubForMindMapInApp && (
+        <ClubMindMapModal
+          isOpen={!!clubForMindMapInApp}
+          onClose={() => setClubForMindMapInApp(null)}
+          club={clubForMindMapInApp}
+          currentUser={currentUser}
+          onUpdated={triggerRefresh}
+          onEnterClubDirectly={(targetClub) => {
+            setClubForMindMapInApp(null);
+            handleSelectClubToSupervise(targetClub);
+          }}
+        />
+      )}
+      {/* MODAL EDITAR CLUB PROFESIONAL (PERFIL, FONDOS TRASLÚCIDOS, TIPOGRAFÍA Y HOJA DE SOFTWARE) */}
+      {clubForEditorModal && (
+        <ClubProfileAndEditorModal
+          isOpen={!!clubForEditorModal}
+          onClose={() => setClubForEditorModal(null)}
+          club={clubForEditorModal}
+          currentUser={currentUser}
+          onUpdated={triggerRefresh}
+        />
+      )}
+
+      {/* MODAL VISIBILIDAD DE MÓDULOS & VENTANAS (OCULTAR O MOSTRAR ICONOS DEL CLUB) */}
+      {isModuleVisibilityModalOpen && currentClub && (
+        <ModuleVisibilityModal
+          isOpen={isModuleVisibilityModalOpen}
+          onClose={() => setIsModuleVisibilityModalOpen(false)}
+          currentClub={currentClub}
+          currentUser={currentUser}
+          onUpdated={triggerRefresh}
+        />
+      )}
+
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary fallbackTitle="Error en la aplicación FRAOVIA">
+      <MainApp />
+    </ErrorBoundary>
+  );
+}

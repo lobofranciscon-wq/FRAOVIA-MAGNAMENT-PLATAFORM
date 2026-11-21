@@ -1,0 +1,727 @@
+import { supabase, isSupabaseConfigured } from '../lib/supabaseClient';
+import { fraoviaDB } from './fraoviaStore';
+import { supabaseDataService, formatSupabaseError } from './supabaseDataService';
+import { supabaseAuditService } from './supabaseAuditService';
+import { Club, ReceiptTemplateConfig, ClubWhatsAppConfig, FeeReminderAutomationConfig, Season, Category, AttendanceRecord, TripParticipant, TripTournament, CashBox, PaymentMethod, Player, Receipt, StoreProduct, StorePromotion, User, SuspensionReason, SUSPENSION_REASON_LABELS } from '../types/fraovia';
+import { supabaseStoreService } from './supabaseStoreService';
+import { supabaseTripService } from './supabaseTripService';
+import { supabaseUserService } from './supabaseUserService';
+import { supabaseProvisionalService } from './supabaseProvisionalService';
+import { supabaseFamilyService } from './supabaseFamilyService';
+import { ProvisionalPlayer } from '../types/fraovia';
+
+/**
+ * Acciones de datos con guardado real.
+ * - Con Supabase configurado: guarda en la base de datos (las reglas RLS validan el rol).
+ * - Sin Supabase (modo demo/local): usa el almacenamiento local como antes.
+ * El SUPERADMIN es de solo lectura (modo fantasma) y no puede modificar datos de un club.
+ */
+
+function generateTempPassword(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+  const arr = new Uint32Array(12);
+  crypto.getRandomValues(arr);
+  const base = Array.from(arr).map(n => chars[n % chars.length]).join('');
+  return base + '#7'; // garantiza mayúscula/minúscula/número/símbolo según la política de Supabase
+}
+
+function assertCanWrite(user: User) {
+  if (isSupabaseConfigured() && user.role === 'SUPERADMIN') {
+    throw new Error('FRAOVIA: El SUPERADMIN está en modo fantasma (solo lectura) y no puede modificar datos del club.');
+  }
+}
+
+async function audit(action: string, detail: string, category: 'caja' | 'jugadores' | 'becas' | 'sistema' | 'tienda' | 'asistencia' | 'viajes' | 'torneos' | 'configuracion' | 'usuarios') {
+  // La base resuelve club y usuario desde la sesión. Si falla, no se corta la operación.
+  await supabaseAuditService.logAudit({ action, detail, category: category as any });
+}
+
+export const dataActions = {
+  /**
+   * Suspende (con motivo) o rehabilita a un deportista.
+   * - Si está activo: `info` es obligatorio (motivo + nota opcional).
+   * - Si está suspendido: se rehabilita y se borra el motivo.
+   */
+  async togglePlayerSuspension(
+    player: Player,
+    info: { reason: SuspensionReason; note?: string } | undefined,
+    user: User
+  ): Promise<Player> {
+    const suspend = player.status !== 'suspendido';
+    if (suspend && !info) throw new Error('Indicá el motivo de la suspensión.');
+    const reasonText = info ? SUSPENSION_REASON_LABELS[info.reason] + (info.note?.trim() ? `: ${info.note.trim()}` : '') : undefined;
+
+    if (!isSupabaseConfigured()) return fraoviaDB.togglePlayerSuspension(player.id, reasonText, user);
+    assertCanWrite(user);
+
+    const updated = await supabaseDataService.updatePlayer(
+      player.id,
+      suspend
+        ? {
+            status: 'suspendido',
+            suspensionReason: info!.reason,
+            suspensionNote: info!.note?.trim() || '',
+            suspendedAt: new Date().toISOString()
+          }
+        : {
+            status: player.balance > 0 ? 'moroso' : 'activo',
+            suspensionReason: '' as any,
+            suspensionNote: '',
+            suspendedAt: ''
+          }
+    );
+    await audit(
+      suspend ? 'JUGADOR_SUSPENDIDO' : 'JUGADOR_REHABILITADO',
+      `${player.firstName} ${player.lastName} (DNI ${player.dni})${suspend ? ' - ' + reasonText : ''}`,
+      'jugadores'
+    );
+    return updated;
+  },
+
+  async changePlayerCategory(player: Player, newCategoryId: string, user: User): Promise<Player> {
+    if (!isSupabaseConfigured()) return fraoviaDB.changePlayerCategory(player.id, newCategoryId, user);
+    assertCanWrite(user);
+    const updated = await supabaseDataService.updatePlayer(player.id, { categoryId: newCategoryId });
+    await audit('JUGADOR_CAMBIO_CATEGORIA', `${player.firstName} ${player.lastName} cambió de categoría`, 'jugadores');
+    return updated;
+  },
+
+  async changePlayerColorBlock(player: Player, blockName: string, user: User): Promise<Player> {
+    if (!isSupabaseConfigured()) return fraoviaDB.changePlayerColorBlock(player.id, blockName, user);
+    assertCanWrite(user);
+    return supabaseDataService.updatePlayer(player.id, { colorBlockName: blockName });
+  },
+
+  /** Beca individual. La base recalcula la cuota mensual sola (trigger). */
+  async setPlayerScholarship(player: Player, percent: number, reason: string, user: User): Promise<Player> {
+    if (!isSupabaseConfigured()) return fraoviaDB.setPlayerScholarship(player.id, percent, reason, user);
+    assertCanWrite(user);
+    const clean = Math.max(0, Math.min(100, Math.round(percent)));
+    const updated = await supabaseDataService.updatePlayer(player.id, {
+      scholarshipPercent: clean,
+      scholarshipReason: clean > 0 ? reason : ''
+    });
+    await audit('BECA_ASIGNADA', `${player.firstName} ${player.lastName}: beca ${clean}%${reason ? ' - ' + reason : ''}`, 'becas');
+    return updated;
+  },
+
+  /**
+   * Descuento por hermanos: 2do y 3er hermano de cada apellido.
+   * Se guarda como beca (porcentaje) para que la base calcule la cuota. Nunca baja una beca mayor ya existente.
+   */
+  async applySiblingDiscounts(
+    families: Player[][],
+    secondPercent: number,
+    thirdPercent: number,
+    user: User
+  ): Promise<number> {
+    if (!isSupabaseConfigured()) return -1; // la pantalla usa su lógica local
+    assertCanWrite(user);
+    let affected = 0;
+    for (const siblings of families) {
+      const targets: Array<[Player | undefined, number]> = [[siblings[1], secondPercent], [siblings[2], thirdPercent]];
+      for (const [p, pct] of targets) {
+        if (!p) continue;
+        const newPct = Math.max(p.scholarshipPercent || 0, Math.round(pct));
+        if (newPct === (p.scholarshipPercent || 0)) continue;
+        await supabaseDataService.updatePlayer(p.id, {
+          scholarshipPercent: newPct,
+          scholarshipReason: p.scholarshipReason || 'Descuento familiar por hermanos'
+        });
+        affected++;
+      }
+    }
+    await audit('DESCUENTOS_FAMILIARES_APLICADOS', `Hermanos: 2do ${secondPercent}% y 3ro ${thirdPercent}%. ${affected} jugadores.`, 'becas');
+    return affected;
+  },
+
+  async renewMedicalCertificate(player: Player, expiryDate: string, user: User): Promise<Player> {
+    if (!isSupabaseConfigured()) {
+      player.medicalCertificateValid = true;
+      player.medicalExpiryDate = expiryDate;
+      fraoviaDB.updatePlayer(player, user);
+      return player;
+    }
+    assertCanWrite(user);
+    const updated = await supabaseDataService.updatePlayer(player.id, {
+      medicalCertificateValid: true,
+      medicalExpiryDate: expiryDate
+    });
+    await audit('APTO_MEDICO_RENOVADO', `${player.firstName} ${player.lastName} (DNI ${player.dni}) hasta ${expiryDate}`, 'jugadores');
+    return updated;
+  },
+
+  /** Guarda en el jugador la RUTA de la foto (club_id/uuid.ext), nunca una URL firmada ni base64. */
+  async updatePlayerPhoto(player: Player, photoPath: string, user: User): Promise<Player> {
+    if (!isSupabaseConfigured()) return fraoviaDB.updatePlayerPhoto(player.id, photoPath, user);
+    assertCanWrite(user);
+    if (photoPath.startsWith('data:') || photoPath.startsWith('blob:')) {
+      throw new Error('La foto debe subirse al almacenamiento antes de guardarse en la ficha.');
+    }
+    return supabaseDataService.updatePlayer(player.id, { photoUrl: photoPath });
+  },
+
+  /**
+   * Importación masiva (Excel). Omite los DNI que ya existen en el club y los informa.
+   * Se inserta por tandas de 50 para no superar límites; las reglas de cupo y DNI único las valida la base.
+   */
+  async importPlayersBatch(
+    rows: Array<Omit<Player, 'id' | 'isRestricted'>>,
+    user: User
+  ): Promise<{ successCount: number; skippedDnis: string[] }> {
+    if (!isSupabaseConfigured()) {
+      const res: any = fraoviaDB.importPlayersBatch(rows as any, user);
+      return { successCount: res.successCount ?? rows.length, skippedDnis: [] };
+    }
+    assertCanWrite(user);
+    if (rows.length === 0) return { successCount: 0, skippedDnis: [] };
+
+    const clubId = rows[0].clubId;
+    const dnis = rows.map(r => r.dni.trim());
+    const { data: existing, error: exErr } = await supabase
+      .from('players')
+      .select('dni')
+      .eq('club_id', clubId)
+      .in('dni', dnis);
+    if (exErr) throw new Error(formatSupabaseError(exErr));
+    const existingSet = new Set((existing || []).map((r: any) => r.dni));
+
+    const seen = new Set<string>();
+    const toInsert: any[] = [];
+    const skippedDnis: string[] = [];
+    for (const r of rows) {
+      const dni = r.dni.trim();
+      if (existingSet.has(dni) || seen.has(dni)) { skippedDnis.push(dni); continue; }
+      seen.add(dni);
+      toInsert.push({
+        club_id: r.clubId,
+        discipline_id: r.disciplineId,
+        category_id: r.categoryId,
+        dni,
+        first_name: r.firstName.trim(),
+        last_name: r.lastName.trim(),
+        birth_date: r.birthDate,
+        phone: r.phone?.trim() || null,
+        email: r.email?.trim() || null,
+        emergency_contact: r.emergencyContact || { name: '', relationship: '', phone: '' },
+        medical_certificate_valid: r.medicalCertificateValid !== false,
+        medical_expiry_date: r.medicalExpiryDate || null,
+        status: r.status || 'activo',
+        balance: r.balance ?? 0,
+        joined_date: r.joinedDate || new Date().toISOString().split('T')[0]
+      });
+    }
+
+    let successCount = 0;
+    for (let i = 0; i < toInsert.length; i += 50) {
+      const chunk = toInsert.slice(i, i + 50);
+      const { error } = await supabase.from('players').insert(chunk);
+      if (error) {
+        throw new Error(
+          `Se importaron ${successCount} deportistas y la importación se detuvo: ${formatSupabaseError(error)}`
+        );
+      }
+      successCount += chunk.length;
+    }
+    await audit('IMPORTACION_JUGADORES', `${successCount} deportistas importados, ${skippedDnis.length} omitidos por DNI repetido`, 'jugadores');
+    return { successCount, skippedDnis };
+  },
+
+  async createCategory(
+    clubId: string,
+    cat: Omit<Category, 'id' | 'clubId'>,
+    user: User
+  ): Promise<Category> {
+    if (!isSupabaseConfigured()) return fraoviaDB.createCategory({ clubId, ...cat } as any, user);
+    assertCanWrite(user);
+
+    // La disciplina debe ser un UUID real de la base. Si el formulario la dejó vacía (o con un id local),
+    // se usa la primera disciplina del club; si el club no tiene ninguna, se avisa.
+    const isUuid = (v?: string) => !!v && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+    let disciplineId = cat.disciplineId;
+    if (!isUuid(disciplineId)) {
+      const disciplines = await supabaseDataService.getDisciplines(clubId);
+      if (disciplines.length === 0) {
+        throw new Error('FRAOVIA: El club todavía no tiene ninguna disciplina creada. Creá primero una disciplina (por ejemplo Fútbol).');
+      }
+      disciplineId = disciplines[0].id;
+    }
+    const gender = ['Masculino', 'Femenino', 'Mixto'].includes(cat.gender as string) ? cat.gender : 'Mixto';
+
+    const created = await supabaseDataService.createCategory(clubId, { ...cat, disciplineId, gender });
+    await audit('CATEGORIA_CREADA', `Categoría "${created.name}"`, 'sistema');
+    return created;
+  },
+
+  // ============================================================================
+  // TIENDA
+  // ============================================================================
+  async addStoreProduct(clubId: string, data: Omit<StoreProduct, 'id' | 'clubId' | 'status'>, user: User): Promise<StoreProduct> {
+    if (!isSupabaseConfigured()) return fraoviaDB.addStoreProduct({ clubId, ...data }, user);
+    assertCanWrite(user);
+    const sku = data.sku?.trim() || `SKU-${Date.now().toString(36).toUpperCase()}`;
+    const created = await supabaseStoreService.createProduct(clubId, { ...data, sku });
+    await audit('PRODUCTO_TIENDA_CREADO', `Nuevo artículo "${created.name}" (SKU ${created.sku}) con stock ${created.stock}.`, 'tienda');
+    return created;
+  },
+
+  async updateStoreProduct(productId: string, updates: Partial<StoreProduct>, user: User): Promise<StoreProduct> {
+    if (!isSupabaseConfigured()) return fraoviaDB.updateStoreProduct(productId, updates, user);
+    assertCanWrite(user);
+    const updated = await supabaseStoreService.updateProduct(productId, updates);
+    await audit('PRODUCTO_TIENDA_MODIFICADO', `Artículo "${updated.name}" actualizado (stock ${updated.stock}, precio $${updated.salePrice}).`, 'tienda');
+    return updated;
+  },
+
+  /** Devuelve 'eliminado' o 'discontinuado' (si el producto ya tiene ventas, se conserva el historial). */
+  async deleteStoreProduct(product: StoreProduct, user: User): Promise<'eliminado' | 'discontinuado'> {
+    if (!isSupabaseConfigured()) {
+      fraoviaDB.deleteStoreProduct(product.id, user);
+      return 'eliminado';
+    }
+    assertCanWrite(user);
+    const result = await supabaseStoreService.deleteProduct(product.id);
+    await audit('PRODUCTO_TIENDA_ELIMINADO', `Artículo "${product.name}" ${result === 'eliminado' ? 'eliminado del catálogo' : 'pasado a discontinuado (tiene ventas registradas)'}.`, 'tienda');
+    return result;
+  },
+
+  async adjustStoreStock(product: StoreProduct, delta: number, reason: string, user: User): Promise<StoreProduct> {
+    if (!isSupabaseConfigured()) return fraoviaDB.adjustStoreStock(product.id, delta, reason, user);
+    assertCanWrite(user);
+    // La bitácora la registra la propia función de la base
+    return supabaseStoreService.adjustStock(product.id, delta, reason);
+  },
+
+  async addStorePromotion(clubId: string, data: Omit<StorePromotion, 'id' | 'createdAt' | 'clubId' | 'createdByUserId'>, user: User): Promise<StorePromotion> {
+    if (!isSupabaseConfigured()) return fraoviaDB.addStorePromotion({ clubId, createdByUserId: user.id, ...data }, user);
+    assertCanWrite(user);
+    const created = await supabaseStoreService.createPromotion(clubId, user.id, data);
+    await audit('PROMOCION_TIENDA_CREADA', `Promoción "${created.name}" creada.`, 'tienda');
+    return created;
+  },
+
+  async updateStorePromotion(id: string, updates: Partial<StorePromotion>, user: User): Promise<StorePromotion> {
+    if (!isSupabaseConfigured()) return fraoviaDB.updateStorePromotion(id, updates, user);
+    assertCanWrite(user);
+    const updated = await supabaseStoreService.updatePromotion(id, updates);
+    await audit('PROMOCION_TIENDA_MODIFICADA', `Promoción "${updated.name}" actualizada (${updated.status}).`, 'tienda');
+    return updated;
+  },
+
+  async deleteStorePromotion(promo: StorePromotion, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) {
+      fraoviaDB.deleteStorePromotion(promo.id, user);
+      return;
+    }
+    assertCanWrite(user);
+    await supabaseStoreService.deletePromotion(promo.id);
+    await audit('PROMOCION_TIENDA_ELIMINADA', `Promoción "${promo.name}" eliminada.`, 'tienda');
+  },
+
+  async processStoreSale(
+    params: {
+      clubId: string;
+      cashBoxId: string;
+      customerName: string;
+      customerDni?: string;
+      paymentMethod: PaymentMethod;
+      items: { productId: string; quantity: number; size?: string }[];
+      discountAmount?: number;
+      promotionName?: string;
+    },
+    user: User
+  ): Promise<Receipt> {
+    if (!isSupabaseConfigured()) {
+      const { receipt } = fraoviaDB.processStoreSale({
+        clubId: params.clubId,
+        customerName: params.customerName,
+        customerDni: params.customerDni,
+        paymentMethod: params.paymentMethod,
+        targetCashBoxId: params.cashBoxId,
+        discountAmount: params.discountAmount,
+        appliedPromotionName: params.promotionName,
+        items: params.items
+      }, user);
+      return receipt;
+    }
+    assertCanWrite(user);
+    return supabaseStoreService.processSaleAtomic({
+      cashBoxId: params.cashBoxId,
+      customerName: params.customerName,
+      customerDni: params.customerDni,
+      paymentMethod: params.paymentMethod,
+      items: params.items,
+      discountAmount: params.discountAmount,
+      promotionName: params.promotionName
+    });
+  },
+
+  async openStoreCashBox(box: CashBox, initialCash: number, shiftName: string, notes: string, user: User): Promise<CashBox> {
+    if (!isSupabaseConfigured()) return fraoviaDB.openCashBox(box.id, initialCash, shiftName, notes, user);
+    assertCanWrite(user);
+    return supabaseStoreService.openCashBox(box.id, initialCash, shiftName, notes);
+  },
+
+  async closeStoreCashBox(box: CashBox, countedCash: number, notes: string, user: User): Promise<CashBox> {
+    if (!isSupabaseConfigured()) return fraoviaDB.closeCashBox(box.id, countedCash, notes, user);
+    assertCanWrite(user);
+    return supabaseStoreService.closeCashBox(box.id, countedCash, notes);
+  },
+
+  // ----------------------------------------------------------------------------
+  // ASISTENCIA
+  // ----------------------------------------------------------------------------
+  async recordAttendance(record: Omit<AttendanceRecord, 'id'>, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) {
+      fraoviaDB.recordAttendance(record, user);
+      return;
+    }
+    assertCanWrite(user);
+    await supabaseTripService.recordAttendance(record);
+  },
+
+  // ----------------------------------------------------------------------------
+  // VIAJES Y TORNEOS
+  // ----------------------------------------------------------------------------
+  async createTrip(data: Omit<TripTournament, 'id' | 'createdAt' | 'cashBoxId'>, user: User): Promise<TripTournament> {
+    if (!isSupabaseConfigured()) return fraoviaDB.createTripTournament(data, user);
+    assertCanWrite(user);
+    const id = await supabaseTripService.createTrip(data);
+    return supabaseTripService.getTrip(id);
+  },
+
+  async updateTrip(trip: TripTournament, user: User): Promise<TripTournament> {
+    if (!isSupabaseConfigured()) return fraoviaDB.updateTripTournament(trip, user);
+    assertCanWrite(user);
+    await supabaseTripService.updateTrip(trip);
+    return supabaseTripService.getTrip(trip.id);
+  },
+
+  async recordTripPayment(
+    trip: TripTournament, playerId: string, amount: number, method: PaymentMethod, notes: string, user: User
+  ): Promise<Receipt> {
+    if (!isSupabaseConfigured()) return fraoviaDB.recordTripPayment(trip.id, playerId, amount, method, notes, user).receipt;
+    assertCanWrite(user);
+    return supabaseTripService.recordTripPayment(trip.id, playerId, amount, method, notes);
+  },
+
+  // ----------------------------------------------------------------------------
+  // PROFESORES Y USUARIOS
+  // ----------------------------------------------------------------------------
+  /**
+   * Da de alta un profesor. Con Supabase se crea la cuenta real (Edge Function create-club-user)
+   * con una contraseña temporal aleatoria que se devuelve UNA sola vez para entregársela al profesor.
+   */
+  async createCoach(
+    data: { fullName: string; email: string; phone?: string; categoryIds: string[]; clubId: string },
+    categories: Category[],
+    user: User
+  ): Promise<{ tempPassword: string | null }> {
+    if (!isSupabaseConfigured()) {
+      fraoviaDB.createCoach(data, user);
+      return { tempPassword: null };
+    }
+    assertCanWrite(user);
+    const tempPassword = generateTempPassword();
+    const disciplineIds = Array.from(new Set(
+      categories.filter(c => data.categoryIds.includes(c.id)).map(c => c.disciplineId)
+    ));
+    await supabaseUserService.createClubUser({
+      email: data.email.trim().toLowerCase(),
+      password: tempPassword,
+      fullName: data.fullName.trim(),
+      role: 'PROFESOR',
+      clubId: data.clubId,
+      phone: data.phone?.trim(),
+      scope: { categoryIds: data.categoryIds, disciplineIds }
+    });
+    return { tempPassword };
+  },
+
+  async toggleUserStatus(target: User, user: User): Promise<User> {
+    if (!isSupabaseConfigured()) return fraoviaDB.toggleUserStatus(target.id, user);
+    assertCanWrite(user);
+    const next = target.status === 'activo' ? 'deshabilitado' : 'activo';
+    const updated = await supabaseDataService.setUserStatus(target.id, next);
+    await audit(next === 'activo' ? 'USUARIO_HABILITADO' : 'USUARIO_DESHABILITADO',
+      `${target.fullName} (${target.role}) fue ${next === 'activo' ? 'habilitado' : 'deshabilitado'} en el sistema.`, 'usuarios');
+    return updated;
+  },
+
+  async assignCategoriesToCoach(coach: User, categoryIds: string[], categories: Category[], user: User): Promise<User> {
+    if (!isSupabaseConfigured()) return fraoviaDB.assignCategoriesToCoach(coach.id, categoryIds, user);
+    assertCanWrite(user);
+    const disciplineIds = Array.from(new Set(
+      categories.filter(c => categoryIds.includes(c.id)).map(c => c.disciplineId)
+    ));
+    const updated = await supabaseDataService.setUserScope(coach.id, { categoryIds, disciplineIds });
+    await audit('CATEGORIAS_PROFESOR_ASIGNADAS',
+      `Asignación de grupos actualizada para ${coach.fullName} (${categoryIds.length} categorías).`, 'usuarios');
+    return updated;
+  },
+
+  async assignCoachToCategory(category: Category, coach: User | null, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) {
+      fraoviaDB.assignCoachToCategory(category.id, coach?.id || '', coach?.fullName || 'Sin Asignar', user);
+      return;
+    }
+    assertCanWrite(user);
+    await supabaseDataService.setCategoryCoach(category.id, coach?.id || null);
+    await audit('PROFESOR_ASIGNADO_CATEGORIA',
+      `Profesor "${coach?.fullName || 'Sin Asignar'}" asignado como titular de la categoría "${category.name}".`, 'jugadores');
+  },
+
+  async changePlayerCoach(player: Player, coach: User | null, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) {
+      fraoviaDB.changePlayerCoach(player.id, coach?.id || '', coach?.fullName || 'Sin Asignar', user);
+      return;
+    }
+    assertCanWrite(user);
+    await supabaseDataService.setPlayerCoach(player.id, coach?.id || null);
+    await audit('JUGADOR_CAMBIO_PROFESOR',
+      `Profesor de ${player.firstName} ${player.lastName} asignado a "${coach?.fullName || 'Sin Asignar'}".`, 'jugadores');
+  },
+
+  /** El usuario edita su propio perfil (nombre, teléfono, foto). */
+  async updateOwnProfile(updated: User, user: User): Promise<User> {
+    if (!isSupabaseConfigured()) return fraoviaDB.updateUser(updated, user);
+    assertCanWrite(user);
+    const saved = await supabaseDataService.updateProfile(updated.id, {
+      fullName: updated.fullName, phone: updated.phone || '', avatarUrl: updated.avatarUrl ?? null
+    });
+    return { ...updated, ...saved };
+  },
+
+  // ----------------------------------------------------------------------------
+  // CONFIGURACIÓN DEL CLUB
+  // ----------------------------------------------------------------------------
+  async saveReceiptTemplate(
+    club: Club,
+    template: Partial<ReceiptTemplateConfig>,
+    whatsapp: Partial<ClubWhatsAppConfig>,
+    user: User
+  ): Promise<Club> {
+    if (!isSupabaseConfigured()) {
+      fraoviaDB.updateClubWhatsAppConfig(club.id, whatsapp, user);
+      return fraoviaDB.updateClubReceiptTemplate(club.id, template, user);
+    }
+    assertCanWrite(user);
+    const prevT = club.receiptTemplate;
+    const receiptTemplate: ReceiptTemplateConfig = {
+      showBadge: template.showBadge ?? prevT?.showBadge ?? true,
+      showWatermark: template.showWatermark ?? prevT?.showWatermark ?? true,
+      badgeUrl: template.badgeUrl ?? (prevT?.badgeUrl || club.logoUrl),
+      watermarkUrl: template.watermarkUrl ?? (prevT?.watermarkUrl || club.logoUrl),
+      watermarkOpacity: template.watermarkOpacity ?? prevT?.watermarkOpacity ?? 0.14,
+      headerTitle: template.headerTitle || prevT?.headerTitle || 'COMPROBANTE OFICIAL DE COBRO',
+      footerLegend: template.footerLegend || prevT?.footerLegend,
+      primaryColor: template.primaryColor || prevT?.primaryColor || club.branding.primaryColor
+    };
+    const prevW = club.whatsappConfig;
+    const whatsappConfig: ClubWhatsAppConfig = {
+      adminPhone: whatsapp.adminPhone ?? (prevW?.adminPhone || club.phone || ''),
+      storePhone: whatsapp.storePhone ?? (prevW?.storePhone || club.phone || ''),
+      adminMessageTemplate: whatsapp.adminMessageTemplate ?? prevW?.adminMessageTemplate,
+      storeMessageTemplate: whatsapp.storeMessageTemplate ?? prevW?.storeMessageTemplate
+    };
+    const saved = await supabaseDataService.updateClub(club.id, { receiptTemplate, whatsappConfig });
+    await audit('PLANTILLA_COMPROBANTE_ACTUALIZADA', 'Plantilla de comprobantes y canales de WhatsApp actualizados.', 'configuracion');
+    return saved;
+  },
+
+  async saveFeeReminderAutomation(club: Club, config: Partial<FeeReminderAutomationConfig>, user: User): Promise<Club> {
+    if (!isSupabaseConfigured()) return fraoviaDB.updateClubFeeReminderAutomation(club.id, config, user);
+    assertCanWrite(user);
+    const p = club.feeReminderAutomation;
+    const feeReminderAutomation: FeeReminderAutomationConfig = {
+      enabled: config.enabled ?? p?.enabled ?? true,
+      startDayOfMonth: config.startDayOfMonth ?? p?.startDayOfMonth ?? 1,
+      dueDayOfMonth: config.dueDayOfMonth ?? p?.dueDayOfMonth ?? 10,
+      graceDays: config.graceDays ?? p?.graceDays ?? 5,
+      messageTemplate: config.messageTemplate || p?.messageTemplate || '¡Hola {socio}! Te recordamos desde {club} que la cuota de {mes} por ${monto} está próxima a vencer el {fecha_vencimiento}. Alias: {cbu_alias}.',
+      cbuAlias: config.cbuAlias ?? p?.cbuAlias ?? '',
+      channel: config.channel || p?.channel || 'whatsapp',
+      autoSendOnMonthStart: config.autoSendOnMonthStart ?? p?.autoSendOnMonthStart ?? true,
+      lastRunDate: config.lastRunDate || p?.lastRunDate
+    };
+    const saved = await supabaseDataService.updateClub(club.id, { feeReminderAutomation });
+    await audit('AUTOMATIZACION_CUOTAS_CONFIGURADA',
+      `Avisos de vencimiento configurados (inicia día ${feeReminderAutomation.startDayOfMonth}, vence día ${feeReminderAutomation.dueDayOfMonth}).`, 'configuracion');
+    return saved;
+  },
+
+  /** Registra el despacho de avisos de cuota (los mensajes salen por el canal que el club use). */
+  async registerFeeReminderBatch(club: Club, playerIds: string[], user: User): Promise<{ sentCount: number; message: string }> {
+    if (!isSupabaseConfigured()) return fraoviaDB.executeFeeRemindersBatch(club.id, playerIds, user);
+    assertCanWrite(user);
+    if (club.feeReminderAutomation) {
+      await supabaseDataService.updateClub(club.id, {
+        feeReminderAutomation: { ...club.feeReminderAutomation, lastRunDate: new Date().toISOString().split('T')[0] }
+      });
+    }
+    await audit('RECORDATORIOS_CUOTAS_ENVIADOS',
+      `Avisos de vencimiento de saldo despachados a ${playerIds.length} socios por ${club.feeReminderAutomation?.channel || 'whatsapp'}.`, 'caja' as any);
+    return {
+      sentCount: playerIds.length,
+      message: `Se despacharon exitosamente ${playerIds.length} mensajes de recordatorio de vencimiento de cuota.`
+    };
+  },
+
+  /** Identidad visual del club (colores, portada, marca de agua) y escudo. */
+  async saveBranding(club: Club, branding: Partial<Club['branding']>, logoUrl: string | undefined, user: User): Promise<Club | null> {
+    if (!isSupabaseConfigured()) {
+      fraoviaDB.updateClubBranding(club.id, branding, logoUrl, user);
+      return null;
+    }
+    assertCanWrite(user);
+    const updates: Partial<Club> = { branding: { ...club.branding, ...branding } as Club['branding'] };
+    if (logoUrl) updates.logoUrl = logoUrl;
+    const saved = await supabaseDataService.updateClub(club.id, updates);
+    await audit('PERSONALIZACION_ACTUALIZADA', 'Identidad visual del club actualizada.', 'configuracion');
+    return saved;
+  },
+
+  async saveClubLogo(club: Club, logoUrl: string, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) {
+      fraoviaDB.updateClub({ ...club, logoUrl } as Club, user);
+      fraoviaDB.logAudit(user, 'ESCUDO_CLUB_ACTUALIZADO', `Nuevo ícono/escudo aplicado al club '${club.name}'.`, 'sistema', club.id);
+      return;
+    }
+    assertCanWrite(user);
+    await supabaseDataService.updateClub(club.id, { logoUrl });
+    await audit('ESCUDO_CLUB_ACTUALIZADO', 'Escudo del club actualizado.', 'configuracion');
+  },
+
+  /** Guarda el diseño del carnet como plantilla del club (dentro de la identidad visual). */
+  async saveCarnetConfig(club: Club, config: any, user: User): Promise<Club> {
+    if (!isSupabaseConfigured()) {
+      fraoviaDB.updateClub({ ...club, branding: { ...club.branding, carnetConfig: config } } as Club, user);
+      fraoviaDB.logAudit(user, 'CARNET_PLANTILLA_GUARDADA', `Plantilla personalizada de carnet guardada para ${club.name}`, 'sistema', club.id);
+      return club;
+    }
+    assertCanWrite(user);
+    const saved = await supabaseDataService.updateClub(club.id, { branding: { ...club.branding, carnetConfig: config } as any });
+    await audit('CARNET_PLANTILLA_GUARDADA', 'Plantilla personalizada de carnet guardada.', 'configuracion');
+    return saved;
+  },
+
+  /** Mostrar u ocultar ventanas del club. Plan y módulos contratados los maneja la plataforma. */
+  async setModuleVisibility(club: Club, modules: Partial<Club['activeModules']>, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) {
+      fraoviaDB.updateClubActiveModules(club.id, modules, user);
+      return;
+    }
+    assertCanWrite(user);
+    const allowed = ['portalFamilias', 'viajesTorneos', 'asistencia', 'feeReminders'] as const;
+    const payload: Record<string, boolean> = {};
+    allowed.forEach(k => { if (modules[k] !== undefined) payload[k] = !!modules[k]; });
+    await supabaseDataService.setModuleVisibility(payload);
+  },
+
+  // ----------------------------------------------------------------------------
+  // TEMPORADAS
+  // ----------------------------------------------------------------------------
+  async createSeason(club: Club, s: { name: string; year: number }, user: User): Promise<void> {
+    const season = {
+      name: s.name.trim(), year: s.year, status: 'futura' as const,
+      startDate: `${s.year}-01-01`, endDate: `${s.year}-12-31`
+    };
+    if (!isSupabaseConfigured()) {
+      (fraoviaDB as any).state.seasons.push({ id: `season-${s.year}-${club.slug}`, clubId: club.id, ...season });
+      fraoviaDB.logAudit(user, 'TEMPORADA_CREADA', `Nueva temporada "${season.name}" dada de alta para ${club.name}`, 'sistema', club.id);
+      return;
+    }
+    assertCanWrite(user);
+    await supabaseDataService.createSeason(club.id, season);
+    await audit('TEMPORADA_CREADA', `Nueva temporada "${season.name}" dada de alta.`, 'configuracion');
+  },
+
+  async closeSeason(club: Club, season: Season, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) {
+      season.status = 'cerrada';
+      fraoviaDB.logAudit(user, 'TEMPORADA_CERRADA', `Temporada ${season.name} cerrada oficialmente. Padrón histórico preservado.`, 'sistema', club.id);
+      return;
+    }
+    assertCanWrite(user);
+    await supabaseDataService.closeSeason(season.id);
+    await audit('TEMPORADA_CERRADA', `Temporada ${season.name} cerrada oficialmente. Padrón histórico preservado.`, 'configuracion');
+  },
+
+  /**
+   * Cambio de plan, cupos o módulos contratados: en Supabase lo gestiona solamente la plataforma
+   * (la base de datos lo rechaza para cualquier usuario del club).
+   */
+  async changeClubPlan(): Promise<never> {
+    throw new Error('FRAOVIA: El plan, los cupos y los módulos contratados los gestiona la plataforma FRAOVIA. Contactá a soporte para cambiarlos.');
+  },
+
+  // ----------------------------------------------------------------------------
+  // LISTADO PROVISORIO Y SOLICITUDES DE ALTA
+  // ----------------------------------------------------------------------------
+  async addProvisionalPlayer(data: Omit<ProvisionalPlayer, 'id' | 'createdAt' | 'status'>, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) { fraoviaDB.addProvisionalPlayer(data, user); return; }
+    assertCanWrite(user);
+    await supabaseProvisionalService.addProvisionalPlayer(data);
+  },
+
+  async deleteProvisionalPlayer(id: string, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) { fraoviaDB.deleteProvisionalPlayer(id, user); return; }
+    assertCanWrite(user);
+    await supabaseProvisionalService.deleteProvisionalPlayer(id);
+  },
+
+  async submitApprovalRequest(categoryId: string, notes: string, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) { fraoviaDB.submitCoachApprovalRequest(categoryId, notes, user); return; }
+    assertCanWrite(user);
+    await supabaseProvisionalService.submitRequest(categoryId, notes);
+  },
+
+  async approveProvisionalPlayer(requestId: string, provId: string, data: Record<string, any>, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) { fraoviaDB.approvePlayerFromRequest(requestId, provId, data as any, user); return; }
+    assertCanWrite(user);
+    await supabaseProvisionalService.approveOne(requestId, provId, data);
+  },
+
+  async approveAllProvisionalPlayers(requestId: string, user: User): Promise<{ approvedCount: number; failed: { name: string; reason: string }[] }> {
+    if (!isSupabaseConfigured()) {
+      const r = fraoviaDB.approveAllPlayersFromRequest(requestId, user);
+      return { approvedCount: r.approvedCount, failed: [] };
+    }
+    assertCanWrite(user);
+    const r = await supabaseProvisionalService.approveAll(requestId);
+    return { approvedCount: r.approved, failed: r.failed };
+  },
+
+  // ----------------------------------------------------------------------------
+  // DESCUENTO POR HERMANOS (solo con Supabase)
+  // ----------------------------------------------------------------------------
+  async familyLink(playerId: string, otherId: string, percent: number, user: User): Promise<string> {
+    if (!isSupabaseConfigured()) throw new Error('El descuento por hermanos está disponible al usar la base de datos en la nube (Supabase).');
+    assertCanWrite(user);
+    return supabaseFamilyService.linkPlayers(playerId, otherId, percent);
+  },
+
+  async familySetPercent(groupId: string, percent: number, effectiveFrom: string, reason: string, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) throw new Error('El descuento por hermanos está disponible al usar la base de datos en la nube (Supabase).');
+    assertCanWrite(user);
+    await supabaseFamilyService.setPercent(groupId, percent, effectiveFrom, reason);
+  },
+
+  async familyMemberLeave(playerId: string, remainingPercent: number, effectiveFrom: string, reason: string, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) throw new Error('El descuento por hermanos está disponible al usar la base de datos en la nube (Supabase).');
+    assertCanWrite(user);
+    await supabaseFamilyService.memberLeave(playerId, remainingPercent, effectiveFrom, reason);
+  },
+
+  async familyCancelChange(changeId: string, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) throw new Error('El descuento por hermanos está disponible al usar la base de datos en la nube (Supabase).');
+    assertCanWrite(user);
+    await supabaseFamilyService.cancelChange(changeId);
+  },
+
+  async rejectApprovalRequest(requestId: string, reason: string, user: User): Promise<void> {
+    if (!isSupabaseConfigured()) { fraoviaDB.rejectCoachApprovalRequest(requestId, reason, user); return; }
+    assertCanWrite(user);
+    await supabaseProvisionalService.reject(requestId, reason);
+  },
+};

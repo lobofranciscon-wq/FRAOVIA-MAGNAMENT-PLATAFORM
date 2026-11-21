@@ -1,0 +1,111 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Background Radial Gradient -->
+    <radialGradient id="bg-grad" cx="70%" cy="30%" r="85%">
+      <stop offset="0%" stopColor="#0E1E42" />
+      <stop offset="45%" stopColor="#081228" />
+      <stop offset="100%" stopColor="#040814" />
+    </radialGradient>
+
+    <!-- Top Left Diagonal Band Gradient -->
+    <linearGradient id="band-top-left" x1="50" y1="0" x2="0" y2="180" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#0072FF" stopOpacity="0.4" />
+      <stop offset="85%" stopColor="#00E5FF" stopOpacity="0.8" />
+      <stop offset="100%" stopColor="#00E5FF" stopOpacity="0.0" />
+    </linearGradient>
+
+    <!-- Bottom Right Diagonal Band Gradient -->
+    <linearGradient id="band-bottom-right" x1="320" y1="460" x2="500" y2="300" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#00E5FF" stopOpacity="0.9" />
+      <stop offset="25%" stopColor="#0072FF" stopOpacity="0.5" />
+      <stop offset="100%" stopColor="#0072FF" stopOpacity="0.0" />
+    </linearGradient>
+
+    <!-- Top Wing Gradient (Vibrant Azure to Radiant Cyan) -->
+    <linearGradient id="wing-top-grad" x1="140" y1="210" x2="400" y2="150" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#0066FF" />
+      <stop offset="40%" stopColor="#0099FF" />
+      <stop offset="75%" stopColor="#00D4FF" />
+      <stop offset="100%" stopColor="#00F0FF" />
+    </linearGradient>
+
+    <!-- Lower Wing & Foot Gradient (Electric Cyan, Cobalt, to Intense Azure) -->
+    <linearGradient id="wing-bottom-grad" x1="180" y1="230" x2="360" y2="290" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#0084FF" />
+      <stop offset="50%" stopColor="#00B4FF" />
+      <stop offset="100%" stopColor="#00E5FF" />
+    </linearGradient>
+
+    <!-- Stem Foot Gradient -->
+    <linearGradient id="stem-foot-grad" x1="130" y1="360" x2="260" y2="280" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#0055FF" />
+      <stop offset="50%" stopColor="#0077FF" />
+      <stop offset="100%" stopColor="#00B4FF" />
+    </linearGradient>
+
+    <!-- Internal Facet Shadow -->
+    <linearGradient id="facet-shadow" x1="180" y1="240" x2="230" y2="340" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#003DB8" stopOpacity="0.8" />
+      <stop offset="100%" stopColor="#0072FF" stopOpacity="0.0" />
+    </linearGradient>
+
+    <!-- Edge Glow Filter -->
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Squircle Base with Deep Rounded Corners -->
+  <rect width="512" height="512" rx="145" fill="url(#bg-grad)" />
+
+  <!-- Diagonal Laser Cut: Top Left Band -->
+  <path d="M 0 160 L 140 20 L 175 45 L 20 200 Z" fill="url(#band-top-left)" />
+  <line x1="0" y1="160" x2="140" y2="20" stroke="#00E5FF" stroke-width="4.5" filter="url(#glow)" />
+
+  <!-- Diagonal Laser Cut: Bottom Right Band -->
+  <path d="M 330 512 L 512 330 L 512 375 L 375 512 Z" fill="url(#band-bottom-right)" />
+  <line x1="330" y1="512" x2="512" y2="330" stroke="#00E5FF" stroke-width="5" filter="url(#glow)" />
+
+  <!-- EMBLEM: Top Aerodynamic Curved Wing -->
+  <path
+    d="M 125 250
+       C 145 185 210 145 385 145
+       C 415 145 428 152 422 165
+       C 408 190 365 220 295 224
+       C 220 228 170 234 125 250 Z"
+    fill="url(#wing-top-grad)"
+  />
+
+  <!-- EMBLEM: Lower Main Wing & Diagonal Swept Foot -->
+  <path
+    d="M 145 264
+       C 195 248 245 246 325 246
+       C 358 246 372 254 366 266
+       C 352 290 315 318 250 322
+       C 230 324 218 335 208 355
+       L 142 435
+       C 134 445 125 442 125 430
+       L 155 315
+       C 158 288 152 274 145 264 Z"
+    fill="url(#wing-bottom-grad)"
+  />
+
+  <!-- Lower Stem Diagonal Facet for 3D Depth -->
+  <path
+    d="M 155 315
+       L 225 265
+       L 250 322
+       C 230 324 218 335 208 355
+       L 142 435
+       C 134 445 125 442 125 430
+       Z"
+    fill="url(#stem-foot-grad)"
+  />
+
+  <!-- Shading overlay on the internal fold -->
+  <path
+    d="M 155 315 L 225 265 L 250 322 L 208 355 Z"
+    fill="url(#facet-shadow)"
+  />
+</svg>

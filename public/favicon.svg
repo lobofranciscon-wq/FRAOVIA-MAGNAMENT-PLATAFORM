@@ -1,0 +1,54 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="fav-bg" cx="70%" cy="30%" r="85%">
+      <stop offset="0%" stopColor="#0E1E42" />
+      <stop offset="45%" stopColor="#081228" />
+      <stop offset="100%" stopColor="#040814" />
+    </radialGradient>
+    <linearGradient id="fav-band-tl" x1="50" y1="0" x2="0" y2="180" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#0072FF" stopOpacity="0.4" />
+      <stop offset="85%" stopColor="#00E5FF" stopOpacity="0.8" />
+      <stop offset="100%" stopColor="#00E5FF" stopOpacity="0.0" />
+    </linearGradient>
+    <linearGradient id="fav-band-br" x1="320" y1="460" x2="500" y2="300" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#00E5FF" stopOpacity="0.9" />
+      <stop offset="25%" stopColor="#0072FF" stopOpacity="0.5" />
+      <stop offset="100%" stopColor="#0072FF" stopOpacity="0.0" />
+    </linearGradient>
+    <linearGradient id="fav-wing-top" x1="140" y1="210" x2="400" y2="150" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#0066FF" />
+      <stop offset="40%" stopColor="#0099FF" />
+      <stop offset="75%" stopColor="#00D4FF" />
+      <stop offset="100%" stopColor="#00F0FF" />
+    </linearGradient>
+    <linearGradient id="fav-wing-bot" x1="180" y1="230" x2="360" y2="290" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#0084FF" />
+      <stop offset="50%" stopColor="#00B4FF" />
+      <stop offset="100%" stopColor="#00E5FF" />
+    </linearGradient>
+    <linearGradient id="fav-stem" x1="130" y1="360" x2="260" y2="280" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stopColor="#0055FF" />
+      <stop offset="50%" stopColor="#0077FF" />
+      <stop offset="100%" stopColor="#00B4FF" />
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="145" fill="url(#fav-bg)" />
+  <path d="M 0 160 L 140 20 L 175 45 L 20 200 Z" fill="url(#fav-band-tl)" />
+  <line x1="0" y1="160" x2="140" y2="20" stroke="#00E5FF" stroke-width="4.5" />
+  <path d="M 330 512 L 512 330 L 512 375 L 375 512 Z" fill="url(#fav-band-br)" />
+  <line x1="330" y1="512" x2="512" y2="330" stroke="#00E5FF" stroke-width="5" />
+
+  <path
+    d="M 125 250 C 145 185 210 145 385 145 C 415 145 428 152 422 165 C 408 190 365 220 295 224 C 220 228 170 234 125 250 Z"
+    fill="url(#fav-wing-top)"
+  />
+  <path
+    d="M 145 264 C 195 248 245 246 325 246 C 358 246 372 254 366 266 C 352 290 315 318 250 322 C 230 324 218 335 208 355 L 142 435 C 134 445 125 442 125 430 L 155 315 C 158 288 152 274 145 264 Z"
+    fill="url(#fav-wing-bot)"
+  />
+  <path
+    d="M 155 315 L 225 265 L 250 322 C 230 324 218 335 208 355 L 142 435 C 134 445 125 442 125 430 Z"
+    fill="url(#fav-stem)"
+  />
+</svg>

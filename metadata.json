@@ -1,0 +1,7 @@
+{
+  "name": "FRAOVIA - Business Management Platform",
+  "description": "Plataforma SaaS profesional para la gestión integral de clubes deportivos con arquitectura multi-club, control por roles, gestión deportiva, caja y tienda.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
